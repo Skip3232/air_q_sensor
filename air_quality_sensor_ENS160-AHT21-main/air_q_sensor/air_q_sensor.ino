@@ -27,6 +27,23 @@
 // Питание сенсора
 #define sensor_pin   4                   // TX UART
 
+// Максимальное количество записей (12 часов * 60 минут = 720)
+#define MAX_RECORDS 720
+
+// Структура для хранения данных датчика
+struct SensorRecord {
+    unsigned long timestamp;  // 4 байта
+    short temp;               // 2 байта (температура * 10)
+    short hum;                // 2 байта (влажность * 10)
+    short aqi;                // 2 байта
+    short tvoc;               // 2 байта
+    short eco2;               // 2 байта
+};  // Итого: 14 байт на запись вместо ~28
+
+SensorRecord sensorHistory[MAX_RECORDS];
+int recordCount = 0;
+int currentIndex = 0;
+
 float temp(NAN), hum(NAN);    // Переменные для хранения значений датчика
 
 // WEBs
@@ -103,7 +120,11 @@ String ch_id = String(ESP.getChipId());
 Sensor_ENS160 ENS160;     //  Инициализируем класс датчика качества воздуха
 AHT20 AHT21;              //  Инициализируем класс датчика температуры и влажности
 
-void setup() {                                          
+void setup() { 
+    // В начале setup() добавьте:
+    Serial.begin(115200);
+    Serial.println();
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());                                         
     EEPROM.begin(sizeof(settings));                                 // Инициализация EEPROM в соответствии с размером структуры конфигурации       
     pinMode(sensor_pin, OUTPUT);
     digitalWrite(sensor_pin, HIGH);                                 // Включаем питание датчика
@@ -160,9 +181,19 @@ void setup() {
         server.on("/index.html", HTTP_GET, [](){
         server.send(200, "text/plain", "Radar Smart Switch"); });
         server.on("/description.xml", HTTP_GET, [](){SSDP.schema(server.client());});
+        server.on("/chart", []() {
+          server.send_P(200, "text/html", CHART_PAGE);
+          });
         server.on("/inline", []() {
-        server.send(200, "text/plain", "this works without need of authentification");
-        });
+          server.send(200, "text/plain", "this works without need of authentification");
+          });
+        server.on("/api/data", HTTP_GET, []() {
+          sendHistoryData();
+          });
+        server.on("/api/clear", HTTP_POST, []() {
+          clearHistory();
+          server.send(200, "application/json", "{\"success\": true}");
+          });
         server.onNotFound(handleNotFound);
         // Здесь список заголовков для записи
         const char * headerkeys[] = {"User-Agent", "Cookie"} ;
@@ -173,7 +204,8 @@ void setup() {
         connect = strlen(settings.mySSID) > 0;                                            // Статус подключения к Wi-Fi сети, если есть имя сети
         SSDP_init();
         ENS160.setOperatingMode(SFE_ENS160_RESET);
-        ENS160.setOperatingMode(SFE_ENS160_STANDARD);                  
+        ENS160.setOperatingMode(SFE_ENS160_STANDARD);     
+        initHistory();             
 }
 
 void loop() {
@@ -212,4 +244,144 @@ void sensor_get(){                                // Обновляем данн
          temp = AHT21.getTemperature() - 2.0;
          hum  = AHT21.getHumidity();;
      }
+     
+     // Добавляем данные в историю
+     if (!isnan(temp) && !isnan(hum) && AQI != -1) {
+         addToHistory(temp, hum, AQI, TVOC, ECO2);
+     }
+}
+
+// Инициализация истории
+void initHistory() {
+    for (int i = 0; i < MAX_RECORDS; i++) {
+        sensorHistory[i].timestamp = 0;
+        sensorHistory[i].temp = NAN;
+        sensorHistory[i].hum = NAN;
+        sensorHistory[i].aqi = -1;
+        sensorHistory[i].tvoc = -1;
+        sensorHistory[i].eco2 = -1;
+    }
+}
+
+// Добавление новых данных в историю
+void addToHistory(float temp, float hum, int aqi, int tvoc, int eco2) {
+    unsigned long now = millis() / 1000;
+    
+    if (recordCount > 0) {
+        int lastIndex = (currentIndex - 1 + MAX_RECORDS) % MAX_RECORDS;
+        if (now - sensorHistory[lastIndex].timestamp < 60) return;
+    }
+    
+    sensorHistory[currentIndex].timestamp = now;
+    sensorHistory[currentIndex].temp = (isnan(temp)) ? -32768 : (short)(temp * 10);
+    sensorHistory[currentIndex].hum = (isnan(hum)) ? -32768 : (short)(hum * 10);
+    sensorHistory[currentIndex].aqi = aqi;
+    sensorHistory[currentIndex].tvoc = tvoc;
+    sensorHistory[currentIndex].eco2 = eco2;
+    
+    currentIndex = (currentIndex + 1) % MAX_RECORDS;
+    if (recordCount < MAX_RECORDS) recordCount++;
+    
+    cleanOldData(now);
+}
+
+// Очистка данных старше 24 часов
+void cleanOldData(unsigned long currentTime) {
+    unsigned long twentyFourHoursAgo = currentTime - (24 * 60 * 60);
+    int cleaned = 0;
+    
+    for (int i = 0; i < MAX_RECORDS; i++) {
+        if (sensorHistory[i].timestamp != 0 && sensorHistory[i].timestamp < twentyFourHoursAgo) {
+            sensorHistory[i].timestamp = 0;
+            sensorHistory[i].temp = NAN;
+            sensorHistory[i].hum = NAN;
+            sensorHistory[i].aqi = -1;
+            sensorHistory[i].tvoc = -1;
+            sensorHistory[i].eco2 = -1;
+            cleaned++;
+        }
+    }
+    
+    if (cleaned > 0) {
+        // Пересчитываем recordCount
+        recordCount = 0;
+        for (int i = 0; i < MAX_RECORDS; i++) {
+            if (sensorHistory[i].timestamp != 0) {
+                recordCount++;
+            }
+        }
+    }
+}
+
+// Очистка всей истории
+void clearHistory() {
+    initHistory();
+    recordCount = 0;
+    currentIndex = 0;
+}
+
+// Отправка данных истории на веб-страницу
+void sendHistoryData() {
+    String response = "{\"success\":true,\"data\":[";
+    
+    int recordsSent = 0;
+    // Отправляем только последние 120 записей (2 часа) для экономии памяти
+    int startIdx = (currentIndex - min(recordCount, 120) + MAX_RECORDS) % MAX_RECORDS;
+    
+    for (int i = 0; i < min(recordCount, 120); i++) {
+        int idx = (startIdx + i) % MAX_RECORDS;
+        if (sensorHistory[idx].timestamp != 0) {
+            if (recordsSent > 0) response += ",";
+            
+            char timeStr[6];
+            unsigned long timestamp = sensorHistory[idx].timestamp;
+            int hour = (timestamp % 86400) / 3600;
+            int minute = (timestamp % 3600) / 60;
+            sprintf(timeStr, "%02d:%02d", hour, minute);
+            
+            response += "{\"time\":\"" + String(timeStr) + "\"";
+            
+            if (!isnan(sensorHistory[idx].temp)) {
+                response += ",\"temp\":" + String(sensorHistory[idx].temp, 1);
+            } else {
+                response += ",\"temp\":null";
+            }
+            
+            if (!isnan(sensorHistory[idx].hum)) {
+                response += ",\"hum\":" + String(sensorHistory[idx].hum, 1);
+            } else {
+                response += ",\"hum\":null";
+            }
+            
+            response += ",\"aqi\":" + String(sensorHistory[idx].aqi);
+            response += ",\"tvoc\":" + String(sensorHistory[idx].tvoc);
+            response += ",\"eco2\":" + String(sensorHistory[idx].eco2) + "}";
+            
+            recordsSent++;
+        }
+    }
+    
+    response += "],\"latest\":{";
+    
+    int lastIdx = (currentIndex - 1 + MAX_RECORDS) % MAX_RECORDS;
+    if (recordCount > 0 && sensorHistory[lastIdx].timestamp != 0) {
+        if (!isnan(sensorHistory[lastIdx].temp)) {
+            response += "\"temp\":" + String(sensorHistory[lastIdx].temp, 1) + ",";
+        } else {
+            response += "\"temp\":null,";
+        }
+        if (!isnan(sensorHistory[lastIdx].hum)) {
+            response += "\"hum\":" + String(sensorHistory[lastIdx].hum, 1) + ",";
+        } else {
+            response += "\"hum\":null,";
+        }
+        response += "\"aqi\":" + String(sensorHistory[lastIdx].aqi) + ",";
+        response += "\"tvoc\":" + String(sensorHistory[lastIdx].tvoc) + ",";
+        response += "\"eco2\":" + String(sensorHistory[lastIdx].eco2);
+    } else {
+        response += "\"temp\":null,\"hum\":null,\"aqi\":null,\"tvoc\":null,\"eco2\":null";
+    }
+    
+    response += "}}";
+    server.send(200, "application/json", response);
 }
